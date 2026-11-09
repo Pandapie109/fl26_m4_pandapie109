@@ -336,16 +336,21 @@ void MainWindow::exit_application() {
 
 void MainWindow::update_action_states() {
     const bool documents_available = !workspace_.documents().empty();
-    const bool query_ready = corpus_current_ && search_widget_->has_query();
+    // A failed or in-progress build must never expose processing operations.
+    const bool processing_available = corpus_current_ && !build_in_progress_;
+    const bool query_ready = processing_available && search_widget_->has_query();
 
     workspace_widget_->set_build_corpus_enabled(documents_available && !build_in_progress_);
     search_widget_->set_search_enabled(query_ready);
-    term_inspector_widget_->set_inspection_enabled(corpus_current_);
+    term_inspector_widget_->set_inspection_enabled(processing_available);
     context_widget_->set_build_context_enabled(query_ready);
 }
 
 void MainWindow::invalidate_corpus() {
     corpus_current_ = false;
+    // Remove the old index as well as disabling the GUI actions. This prevents
+    // a failed rebuild or changed Workspace from retaining processable data.
+    processing_core_ = ProcessingCore();
     workspace_widget_->set_corpus_status("Not built");
     clear_processing_outputs();
     update_action_states();

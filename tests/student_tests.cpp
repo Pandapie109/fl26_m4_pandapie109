@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QProcess>
 #include <QPushButton>
@@ -40,6 +41,12 @@ QLabel* status(aiws::gui::MainWindow& w) {
 }
 QPushButton* build_button(aiws::gui::MainWindow& w) {
     return w.findChild<QPushButton*>("buildCorpusButton");
+}
+QPushButton* action_button(aiws::gui::MainWindow& w, const QString& label) {
+    for (auto* button : w.findChildren<QPushButton*>()) {
+        if (button->text() == label) return button;
+    }
+    return nullptr;
 }
 } // namespace
 
@@ -122,6 +129,51 @@ private slots:
         w.set_build_factory({});
         QTest::mouseClick(build_button(w), Qt::LeftButton);
         QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 2500);
+    }
+
+    void failed_rebuild_disables_processing_until_success() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = make_file(dir.path(), "current.txt", "alpha beta gamma");
+        QVERIFY(!path.isEmpty());
+        aiws::gui::MainWindow w;
+        w.show();
+        QVERIFY(w.add_document_file(path));
+
+        auto* search = action_button(w, "Search");
+        auto* inspect = action_button(w, "Inspect");
+        auto* context = action_button(w, "Build Context");
+        auto* query = w.findChild<QLineEdit*>();
+        QVERIFY(search && inspect && context && query);
+
+        query->setText("alpha");
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 2500);
+        QVERIFY(search->isEnabled());
+        QVERIFY(inspect->isEnabled());
+        QVERIFY(context->isEnabled());
+
+        w.set_build_factory([]() -> std::unique_ptr<aiws::ProcessingCore> {
+            throw std::runtime_error("intentional failed rebuild");
+        });
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QVERIFY(!search->isEnabled());
+        QVERIFY(!inspect->isEnabled());
+        QVERIFY(!context->isEnabled());
+
+        QTRY_VERIFY_WITH_TIMEOUT(status(w)->text().contains("Corpus build failed"), 2500);
+        QCOMPARE(corpus(w)->text(), QString("Not built"));
+        QVERIFY(!search->isEnabled());
+        QVERIFY(!inspect->isEnabled());
+        QVERIFY(!context->isEnabled());
+        QVERIFY(build_button(w)->isEnabled());
+
+        w.set_build_factory({});
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 2500);
+        QVERIFY(search->isEnabled());
+        QVERIFY(inspect->isEnabled());
+        QVERIFY(context->isEnabled());
     }
 
     void unreadable_path_has_no_effect() {
