@@ -2,6 +2,8 @@
 #include "aiws/ipc.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <chrono>
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -21,31 +23,54 @@
 using namespace std::chrono_literals;
 
 int main() {
-    // Verify that real ProcessingCore work happens on a separate std::thread.
+    // The same thread is used for both successful and failed builds.
     aiws::Workspace ws;
     ws.add_document(aiws::Document("id1", "title1", "one two three four"));
     aiws::AsyncCorpusBuild worker;
+    const auto id = worker.thread_id();
     if (!worker.start(ws, 21, 80)) return 1;
-    if (!worker.running()) return 2;
     aiws::AsyncCorpusBuild::Result built;
-    bool completed = false;
-    for (int i = 0; i < 200; ++i) {
-        if (worker.try_take_result(built)) { completed = true; break; }
-        std::this_thread::sleep_for(10ms);
-    }
-    if (!completed || !built.succeeded() || built.workspace_revision != 21 ||
-        built.core->chunk_count() == 0) return 3;
+    if (!worker.wait_for_result(built, 1500ms) || !built.succeeded() ||
+        built.workspace_revision != 21 || built.core->chunk_count() == 0) return 2;
 
     worker.set_factory([]() -> std::unique_ptr<aiws::ProcessingCore> {
         throw std::runtime_error("expected failure");
     });
-    if (!worker.start(ws, 22, 0)) return 4;
-    completed = false;
-    for (int i = 0; i < 200; ++i) {
-        if (worker.try_take_result(built)) { completed = true; break; }
-        std::this_thread::sleep_for(10ms);
+    if (!worker.start(ws, 22, 0)) return 3;
+    if (!worker.wait_for_result(built, 1500ms) ||
+        built.error != "expected failure" || worker.thread_id() != id) return 4;
+    worker.set_factory({});
+
+    // Cancel a build after it has actually started, then hand off a new one.
+    aiws::Workspace large;
+    for (int i = 0; i < 6; ++i) {
+        large.add_document(aiws::Document("old" + std::to_string(i), "title", "text"));
     }
-    if (!completed || built.error != "expected failure") return 5;
+    if (!worker.start(large, 23, 350)) return 25;
+    // A second condition-variable notification confirms the worker is active.
+    // This test does not need to guess how long thread startup takes.
+    if (!worker.wait_until_active(1000ms)) return 26;
+    worker.request_cancel();
+    if (!worker.start(ws, 24, 0)) return 27;
+    const auto start = std::chrono::steady_clock::now();
+    bool got_new_build = false;
+    while (std::chrono::steady_clock::now() - start < 1400ms) {
+        if (!worker.wait_for_result(built, 1400ms)) break;
+        if (built.workspace_revision == 24 && built.succeeded()) {
+            got_new_build = true;
+            break;
+        }
+    }
+    if (!got_new_build || worker.thread_id() != id) return 28;
+    if (!worker.wait_until_waiting(1000ms)) return 29;
+
+    // Exit should wake a worker even during a long document delay.
+    auto exiting = std::make_unique<aiws::AsyncCorpusBuild>();
+    if (!exiting->start(large, 30, 1500)) return 30;
+    if (!exiting->wait_until_active(1000ms)) return 31;
+    const auto exit_start = std::chrono::steady_clock::now();
+    exiting.reset();
+    if (std::chrono::steady_clock::now() - exit_start > 900ms) return 32;
 
     char dirname[] = "/tmp/m4-ipc-test-XXXXXX";
     if (!::mkdtemp(dirname)) return 6;
@@ -53,12 +78,16 @@ int main() {
     const std::string socket = std::string(dirname) + "/socket.sock";
     { std::ofstream out(filepath); out << "document"; }
     std::promise<std::string> observed;
-    std::atomic<int> adds{0};
+    std::mutex adds_mutex;
+    std::condition_variable adds_cv;
+    int adds = 0;
     auto future = observed.get_future();
     aiws::ipc::Server server;
     std::string error;
-    if (!server.start(socket, [&observed, &adds](const std::string& path) {
+    if (!server.start(socket, [&observed, &adds, &adds_mutex, &adds_cv](const std::string& path) {
+          std::lock_guard<std::mutex> lock(adds_mutex);
           if (++adds == 1) observed.set_value(path);
+          adds_cv.notify_all();
         }, error)) {
         std::cerr << error << '\n'; return 7;
     }
@@ -87,8 +116,10 @@ int main() {
     unsigned char accepted = 255;
     if (::recv(client, &accepted, 1, 0) != 1 || accepted != 0) return 20;
     ::close(client);
-    for (int i = 0; i < 100 && adds.load() < 2; ++i) std::this_thread::sleep_for(10ms);
-    if (adds.load() != 2) return 21;
+    {
+        std::unique_lock<std::mutex> lock(adds_mutex);
+        if (!adds_cv.wait_for(lock, 1000ms, [&adds] { return adds == 2; })) return 21;
+    }
     // Shutdown must interrupt even a client holding a partial request open.
     const int stalled = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (stalled < 0) return 22;

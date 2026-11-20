@@ -4,18 +4,20 @@
 #include "aiws/workspace.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
-#include <future>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
 namespace aiws {
 
-// A single-owner, non-Qt builder. All ProcessingCore::rebuild work runs on
-// std::thread; the GUI polls try_take_result without blocking.
-// The caller must call try_take_result after a completed build before start.
+// Keeps one worker alive instead of starting another thread for each build.
 class AsyncCorpusBuild final {
 public:
     struct Result {
@@ -30,32 +32,57 @@ public:
     };
 
     using CoreFactory = std::function<std::unique_ptr<ProcessingCore>()>;
+    using FinishedNotice = std::function<void()>;
 
-    explicit AsyncCorpusBuild(CoreFactory factory = {});
+    explicit AsyncCorpusBuild(CoreFactory factory = {}, FinishedNotice notice = {});
     ~AsyncCorpusBuild();
 
     AsyncCorpusBuild(const AsyncCorpusBuild&) = delete;
     AsyncCorpusBuild& operator=(const AsyncCorpusBuild&) = delete;
-    AsyncCorpusBuild(AsyncCorpusBuild&&) = delete;
-    AsyncCorpusBuild& operator=(AsyncCorpusBuild&&) = delete;
 
-    // Returns false if there is an unconsumed/active build.
-    // Copies of all mutable workspace content are handed to the worker.
-    bool start(Workspace snapshot, std::uint64_t revision,
-               int extra_ms_per_document);
-
-    // Non-blocking. Returns true only when out receives a finished result.
-    bool try_take_result(Result& out);
-
-    bool running() const noexcept;
-    void set_factory(CoreFactory factory); // GUI-thread-only, when idle
+    // A newer request replaces one that the worker has not picked up yet.
+    bool start(Workspace snapshot, std::uint64_t revision, int extra_ms_per_document);
     void request_cancel() noexcept;
+    bool try_take_result(Result& out);
+    bool wait_for_result(Result& out, std::chrono::milliseconds timeout);
+    bool running() const;
+    bool active() const;
+    bool waiting() const;
+    bool wait_until_waiting(std::chrono::milliseconds timeout);
+    bool wait_until_active(std::chrono::milliseconds timeout);
+    std::thread::id thread_id() const noexcept;
+    void set_factory(CoreFactory factory);
+    void stop() noexcept;
 
 private:
+    struct Request {
+        Workspace snapshot;
+        std::uint64_t revision{0};
+        std::uint64_t generation{0};
+        int delay_ms{0};
+        CoreFactory factory;
+    };
+
+    void work_loop();
+    bool cancelled(std::uint64_t generation) const noexcept;
+    void wait_for_delay(std::uint64_t generation, int delay_ms);
+
+    // These two are atomic because the GUI can change them during a build.
+    std::atomic<std::uint64_t> generation_{0};
+    std::atomic<bool> stopping_{false};
+
+    // The request, results, and worker status are all protected by mutex_.
+    mutable std::mutex mutex_;
+    std::condition_variable request_cv_;
+    std::condition_variable delay_cv_;
+    std::condition_variable result_cv_;
+    std::optional<Request> pending_;
+    std::deque<Result> results_;
+    bool active_{false};
+    bool waiting_{false};
     CoreFactory factory_;
-    std::atomic<bool> cancel_{false};
-    std::thread thread_;
-    std::future<Result> future_;
+    FinishedNotice notice_;
+    std::thread worker_;
 };
 
-}  // namespace aiws
+} // namespace aiws

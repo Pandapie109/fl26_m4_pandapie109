@@ -1,6 +1,7 @@
 #include "aiws/gui/main_window.hpp"
 
 #include "aiws/gui/context_widget.hpp"
+#include "aiws/gui/corpus_state.hpp"
 #include "aiws/gui/resettable.hpp"
 #include "aiws/gui/search_widget.hpp"
 #include "aiws/gui/term_inspector_widget.hpp"
@@ -13,12 +14,15 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
-#include <QTimer>
-#include <QMetaObject>
+#include <QSocketNotifier>
 #include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 #include <exception>
 #include <stdexcept>
 #include <utility>
@@ -26,7 +30,24 @@
 
 namespace aiws::gui {
 
-MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent),
+      builder_({}, [this] { notify_gui(); }),
+      state_(empty_corpus_state()) {
+    // The pipe lets background threads wake the GUI without calling Qt.
+    int fds[2];
+    if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) {
+        throw std::runtime_error(std::string("Cannot create notification pipe: ") +
+                                 std::strerror(errno));
+    }
+    notification_read_fd_ = fds[0];
+    notification_write_fd_ = fds[1];
+    notification_watcher_ = new QSocketNotifier(notification_read_fd_,
+                                                QSocketNotifier::Read, this);
+    connect(notification_watcher_,
+            &QSocketNotifier::activated,
+            this, &MainWindow::handle_notifications);
+
     setWindowTitle("AI Workspace");
     resize(900, 900);
 
@@ -104,18 +125,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(exit_button_, &QPushButton::clicked,
             this, &MainWindow::exit_application);
 
-    build_timer_ = new QTimer(this);
-    build_timer_->setInterval(20);
-    connect(build_timer_, &QTimer::timeout, this, &MainWindow::poll_build_completion);
-    build_timer_->start();
     update_action_states();
 }
 
 MainWindow::~MainWindow() {
-    // Shutdown order: stop accepting external requests before QObject teardown.
-    // The worker's destructor requests cancellation and joins (no detached threads).
     ipc_server_.stop();
-    builder_.request_cancel();
+    // Every state uses the same worker shutdown. This joins before the
+    // window and its widgets are destroyed.
+    state_->exit(*this);
+    notification_watcher_->setEnabled(false);
+    ::close(notification_read_fd_);
+    ::close(notification_write_fd_);
+    notification_read_fd_ = -1;
+    notification_write_fd_ = -1;
 }
 
 void MainWindow::set_build_delay_ms(int ms_per_document) {
@@ -126,20 +148,58 @@ void MainWindow::set_build_factory(aiws::AsyncCorpusBuild::CoreFactory factory) 
     builder_.set_factory(std::move(factory));
 }
 
+bool MainWindow::build_worker_active() const {
+    return builder_.active();
+}
+
+bool MainWindow::build_worker_waiting() const {
+    return builder_.waiting();
+}
+
 bool MainWindow::start_ipc_server(const QString& socket_path, QString* error) {
     std::string problem;
     const bool success = ipc_server_.start(socket_path.toUtf8().toStdString(),
         [this](const std::string& file) {
-            // A queued method call does not wait for the GUI thread. The main
-            // window is kept alive until after ipc_server_.stop() joins.
-            const QString path = QString::fromUtf8(file.data(), static_cast<int>(file.size()));
-            if (!QMetaObject::invokeMethod(this, "remote_document_arrived",
-                      Qt::QueuedConnection, Q_ARG(QString, path))) {
-                throw std::runtime_error("Could not queue GUI file addition");
+            // Save the path first. The GUI reads it after the pipe wakes it.
+            {
+                std::lock_guard<std::mutex> lock(remote_files_mutex_);
+                remote_files_.push_back(file);
             }
+            notify_gui();
         }, problem);
     if (error) *error = QString::fromUtf8(problem.c_str());
     return success;
+}
+
+void MainWindow::notify_gui() noexcept {
+    // One byte is enough. If the pipe is full, it is already readable.
+    const char byte = 1;
+    ssize_t n;
+    do {
+        n = ::write(notification_write_fd_, &byte, 1);
+    } while (n < 0 && errno == EINTR);
+}
+
+void MainWindow::handle_notifications() {
+    // Drain the nonblocking pipe before handling the work it represents.
+    char bytes[128];
+    for (;;) {
+        const ssize_t n = ::read(notification_read_fd_, bytes, sizeof(bytes));
+        if (n > 0) continue;
+        if (n < 0 && errno == EINTR) continue;
+        break;
+    }
+
+    std::deque<std::string> files;
+    {
+        std::lock_guard<std::mutex> lock(remote_files_mutex_);
+        files.swap(remote_files_);
+    }
+    for (const auto& file : files) {
+        remote_document_arrived(QString::fromUtf8(file.data(),
+                                  static_cast<int>(file.size())));
+    }
+    poll_build_completion();
 }
 
 void MainWindow::remote_document_arrived(const QString& path) {
@@ -179,64 +239,26 @@ bool MainWindow::add_document_file(const QString& path) {
                                      info.fileName().toUtf8().toStdString(),
                                      contents.toUtf8().toStdString()));
     ++workspace_revision_;
-    invalidate_corpus();
+    if (auto next = state_->workspace_changed(*this)) state_ = std::move(next);
+    update_action_states();
     workspace_widget_->add_document(info.fileName());
     status_label_->setText("Added " + info.fileName() + ". Build the corpus to search.");
     return true;
 }
 
 void MainWindow::build_corpus() {
-    if (workspace_.documents().empty() || build_in_progress_) return;
-
-    // Never rebuild on the GUI thread. The worker takes an owned snapshot.
-    invalidate_corpus();
-    if (!builder_.start(workspace_, workspace_revision_, build_delay_ms_)) {
-        status_label_->setText("Could not start corpus build.");
-        return;
-    }
-    build_in_progress_ = true;
-    workspace_widget_->set_corpus_status("Building...");
-    status_label_->setText("Building corpus in background...");
+    if (auto next = state_->build_requested(*this)) state_ = std::move(next);
     update_action_states();
 }
 
 void MainWindow::poll_build_completion() {
-    if (!build_in_progress_) return;
     aiws::AsyncCorpusBuild::Result result;
-    if (!builder_.try_take_result(result)) return;
-
-#ifndef AIWS_FAULT_ACCEPT_STALE
-    // A document add or Reset invalidates all older build completions.
-    if (result.workspace_revision != workspace_revision_) {
-        build_in_progress_ = false;
+    while (builder_.try_take_result(result)) {
+        if (auto next = state_->build_finished(*this, result)) {
+            state_ = std::move(next);
+        }
         update_action_states();
-        status_label_->setText("Outdated corpus build discarded.");
-        return;
     }
-#endif
-    if (!result.error.empty() || result.cancelled || !result.core) {
-#ifdef AIWS_FAULT_LOSE_FAILURE
-        // Intentional fault: drop the error event and remain in Building.
-        return;
-#else
-        build_in_progress_ = false;
-        invalidate_corpus();
-        status_label_->setText("Corpus build failed: " +
-                               QString::fromUtf8(result.error.empty()
-                                ? "Build cancelled" : result.error.c_str()));
-        update_action_states();
-        return;
-#endif
-    }
-    // The completed core is now GUI-thread-owned. No worker accesses it.
-    processing_core_ = std::move(*result.core);
-    build_in_progress_ = false;
-    corpus_current_ = true;
-    clear_processing_outputs();
-    workspace_widget_->set_corpus_status(
-        QString::number(static_cast<qulonglong>(processing_core_.chunk_count())) + " chunks");
-    status_label_->setText("Corpus built.");
-    update_action_states();
 }
 
 void MainWindow::document_selected(int row) {
@@ -253,7 +275,7 @@ void MainWindow::document_selected(int row) {
 }
 
 void MainWindow::search_requested(const QString& query, int k) {
-    if (!corpus_current_ || query.trimmed().isEmpty()) return;
+    if (!state_->can_process() || query.trimmed().isEmpty()) return;
 
     try {
         auto results = processing_core_.search(query.toStdString(), k);
@@ -273,7 +295,7 @@ void MainWindow::query_changed(const QString& query) {
 }
 
 void MainWindow::build_context_requested(int token_budget) {
-    if (!corpus_current_ || !search_widget_->has_query()) return;
+    if (!state_->can_process() || !search_widget_->has_query()) return;
 
     try {
         const auto items = processing_core_.build_context(
@@ -300,7 +322,7 @@ void MainWindow::source_document_requested(const QString& document_id) {
 
 void MainWindow::term_inspection_requested(const QString& term,
                                            const QString& chunk_id) {
-    if (!corpus_current_ || term.trimmed().isEmpty()) return;
+    if (!state_->can_process() || term.trimmed().isEmpty()) return;
 
     try {
         const auto df = processing_core_.document_frequency(term.toStdString());
@@ -317,9 +339,8 @@ void MainWindow::term_inspection_requested(const QString& term,
 
 void MainWindow::reset_application() {
     workspace_.clear();
-    ++workspace_revision_; // Reset invalidates an in-flight snapshot, even if empty.
-    processing_core_ = ProcessingCore();
-    corpus_current_ = false;
+    ++workspace_revision_;
+    if (auto next = state_->reset(*this)) state_ = std::move(next);
 
     std::vector<Resettable*> components{
         workspace_widget_, search_widget_, term_inspector_widget_, context_widget_
@@ -335,25 +356,19 @@ void MainWindow::exit_application() {
 }
 
 void MainWindow::update_action_states() {
-    const bool documents_available = !workspace_.documents().empty();
-    // A failed or in-progress build must never expose processing operations.
-    const bool processing_available = corpus_current_ && !build_in_progress_;
+    const bool processing_available = state_->can_process();
     const bool query_ready = processing_available && search_widget_->has_query();
 
-    workspace_widget_->set_build_corpus_enabled(documents_available && !build_in_progress_);
+    workspace_widget_->set_build_corpus_enabled(state_->can_build());
     search_widget_->set_search_enabled(query_ready);
     term_inspector_widget_->set_inspection_enabled(processing_available);
     context_widget_->set_build_context_enabled(query_ready);
 }
 
 void MainWindow::invalidate_corpus() {
-    corpus_current_ = false;
-    // Remove the old index as well as disabling the GUI actions. This prevents
-    // a failed rebuild or changed Workspace from retaining processable data.
     processing_core_ = ProcessingCore();
     workspace_widget_->set_corpus_status("Not built");
     clear_processing_outputs();
-    update_action_states();
 }
 
 void MainWindow::clear_processing_outputs() {

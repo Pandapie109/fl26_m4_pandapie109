@@ -39,7 +39,7 @@ int main(int argc, char* argv[]) {
                 delay = number;
             }
         } else {
-            std::cerr << "Usage: ai_workspace_m4 [--build-delay-ms N] [--ipc-socket PATH]\n";
+            std::cerr << "Usage: ai_workspace_m5 [--build-delay-ms N] [--ipc-socket PATH]\n";
             return 1;
         }
     }

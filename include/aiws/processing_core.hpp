@@ -7,6 +7,7 @@
 #include "aiws/workspace.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +34,11 @@ public:
     static std::string normalize(const std::string& text);
 
     void rebuild(const Workspace& workspace);
+    // Returns false if the workspace changed before this build finished.
+    bool rebuild_cancelable(const Workspace& workspace,
+                            const std::function<bool()>& cancelled,
+                            int delay_ms_per_document,
+                            const std::function<void(int)>& wait_for_delay = {});
     const std::vector<Chunk>& chunks() const noexcept;
     std::size_t chunk_count() const noexcept;
 

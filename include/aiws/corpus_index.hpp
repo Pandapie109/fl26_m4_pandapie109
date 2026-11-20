@@ -3,6 +3,7 @@
 #include "aiws/processing_types.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,8 @@ public:
     explicit CorpusIndex(const std::vector<Chunk>& chunks);
 
     void build(const std::vector<Chunk>& chunks);
+    bool build_cancelable(const std::vector<Chunk>& chunks,
+                          const std::function<bool()>& cancelled);
     std::size_t document_frequency(const std::string& normalized_term) const noexcept;
     std::size_t term_frequency(const std::string& normalized_term,
                                const std::string& chunk_id) const noexcept;

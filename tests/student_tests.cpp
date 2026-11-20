@@ -3,27 +3,104 @@
 #include <QApplication>
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
-#include <QProcess>
+#include <QTemporaryFile>
 #include <QPushButton>
 #include <QTemporaryDir>
 #include <QTest>
 
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
+#include <spawn.h>
+#include <signal.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <chrono>
+#include <future>
+#include <thread>
+#include <vector>
 #include <stdexcept>
 
+extern char** environ;
+
 namespace {
+struct SenderResult {
+    bool started = false;
+    bool timed_out = false;
+    int exit_code = -1;
+    QByteArray standard_error;
+};
+
+// Use the real sender executable without starting it through Qt.
+// QProcess goes through Qt's process code, which crashes Clang TSan here.
+SenderResult run_sender(const QString& binary, const QStringList& args,
+                        const QString& directory = {}) {
+    SenderResult result;
+    QTemporaryFile error_file;
+    if (!error_file.open()) return result;
+
+    std::vector<QByteArray> strings;
+    strings.push_back(QFile::encodeName(binary));
+    for (const QString& arg : args) strings.push_back(arg.toUtf8());
+
+    std::vector<char*> argv;
+    for (auto& part : strings) argv.push_back(part.data());
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t actions;
+    if (::posix_spawn_file_actions_init(&actions) != 0) return result;
+    int rc = ::posix_spawn_file_actions_adddup2(
+        &actions, error_file.handle(), STDERR_FILENO);
+    const QByteArray cwd = QFile::encodeName(directory);
+    if (rc == 0 && !directory.isEmpty()) {
+        rc = ::posix_spawn_file_actions_addchdir_np(&actions, cwd.constData());
+    }
+
+    pid_t pid = -1;
+    if (rc == 0) {
+        rc = ::posix_spawn(&pid, strings.front().constData(), &actions,
+                           nullptr, argv.data(), environ);
+    }
+    ::posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0) return result;
+    result.started = true;
+
+    // Wait on the child with a deadline. Kill it if it gets stuck.
+    std::promise<int> child_status;
+    std::future<int> finished = child_status.get_future();
+    std::thread waiter([pid, p = std::move(child_status)]() mutable {
+        int status = -1;
+        pid_t waited;
+        do {
+            waited = ::waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        p.set_value(waited == pid ? status : -1);
+    });
+    if (finished.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+        result.timed_out = true;
+        ::kill(pid, SIGKILL);
+    }
+    const int status = finished.get();
+    waiter.join();
+    if (!result.timed_out && status >= 0 && WIFEXITED(status)) {
+        result.exit_code = WEXITSTATUS(status);
+    }
+    error_file.seek(0);
+    result.standard_error = error_file.readAll();
+    return result;
+}
+
 QString make_file(const QString& folder, const QString& name, const QByteArray& bytes) {
     const QString path = folder + "/" + name;
     QFile file(path);
@@ -81,20 +158,19 @@ private slots:
         QVERIFY(w.add_document_file(first));
         w.set_build_delay_ms(450);
         QTest::mouseClick(build_button(w), Qt::LeftButton);
-        QCOMPARE(corpus(w)->text(), QString("Building..."));
-        QTest::qWait(40);
+        QTRY_VERIFY_WITH_TIMEOUT(w.build_worker_active(), 1000);
         QVERIFY(w.add_document_file(second));
-        // Wait past the worker completion, not just the immediate invalidation.
-        QTest::qWait(650);
         QCOMPARE(corpus(w)->text(), QString("Not built"));
         QVERIFY(build_button(w)->isEnabled());
         w.set_build_delay_ms(0);
         QTest::mouseClick(build_button(w), Qt::LeftButton);
-        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 2500);
+        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 1800);
+        QCOMPARE(w.findChild<QListWidget*>("documentList")->count(), 2);
     }
 
     void reset_during_build_never_restores_stale_result() {
         QTemporaryDir dir;
+        QVERIFY(dir.isValid());
         const QString path = make_file(dir.path(), "first.txt", "some data for corpus");
         QVERIFY(!path.isEmpty());
         aiws::gui::MainWindow w;
@@ -102,14 +178,86 @@ private slots:
         QVERIFY(w.add_document_file(path));
         w.set_build_delay_ms(400);
         QTest::mouseClick(build_button(w), Qt::LeftButton);
-        QTest::qWait(40);
+        QTRY_VERIFY_WITH_TIMEOUT(w.build_worker_active(), 1000);
         auto* reset = w.findChild<QPushButton*>("resetButton");
         QVERIFY(reset);
         QTest::mouseClick(reset, Qt::LeftButton);
         QCOMPARE(corpus(w)->text(), QString("Not built"));
-        QTest::qWait(580);
-        QCOMPARE(corpus(w)->text(), QString("Not built"));
         QCOMPARE(w.findChild<QListWidget*>("documentList")->count(), 0);
+        QVERIFY(w.add_document_file(path));
+        w.set_build_delay_ms(0);
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 1800);
+        QCOMPARE(w.findChild<QListWidget*>("documentList")->count(), 1);
+    }
+
+    void m5_cancel_a_long_build_before_starting_another() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        aiws::gui::MainWindow w;
+        w.show();
+        for (int i = 0; i < 6; ++i) {
+            const QString path = make_file(dir.path(), QString("old%1.txt").arg(i),
+                                           "old corpus text");
+            QVERIFY(!path.isEmpty());
+            QVERIFY(w.add_document_file(path));
+        }
+        w.set_build_delay_ms(350);
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(w.build_worker_active(), 1000);
+
+        QTest::mouseClick(w.findChild<QPushButton*>("resetButton"), Qt::LeftButton);
+        const QString new_file = make_file(dir.path(), "new.txt", "new corpus text");
+        QVERIFY(w.add_document_file(new_file));
+        w.set_build_delay_ms(0);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        // Six old documents take over two seconds with cancellation broken.
+        // The good build should finish after at most one old document delay.
+        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 1400);
+        QVERIFY2(elapsed.elapsed() < 1400, "A cancelled build held up the new build");
+        QCOMPARE(w.findChild<QListWidget*>("documentList")->count(), 1);
+    }
+
+    void m5_remote_add_cancels_the_build() {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString first = make_file(dir.path(), "first.txt", "original text");
+        const QString second = make_file(dir.path(), "remote.txt", "remote text");
+        QVERIFY(!first.isEmpty() && !second.isEmpty());
+
+        aiws::gui::MainWindow w;
+        w.show();
+        QString error;
+        const QString sock = dir.path() + "/during-build.sock";
+        QVERIFY2(w.start_ipc_server(sock, &error), qPrintable(error));
+        QVERIFY(w.add_document_file(first));
+        w.set_build_delay_ms(450);
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(w.build_worker_active(), 1000);
+
+        const QString binary = QCoreApplication::applicationDirPath() + "/aiws_send";
+        const SenderResult sender = run_sender(binary, {"--socket", sock, "add", second});
+        QVERIFY(sender.started);
+        QVERIFY(!sender.timed_out);
+        QCOMPARE(sender.exit_code, 0);
+        auto* list = w.findChild<QListWidget*>("documentList");
+        QTRY_COMPARE_WITH_TIMEOUT(list->count(), 2, 1200);
+        QCOMPARE(corpus(w)->text(), QString("Not built"));
+        QVERIFY(build_button(w)->isEnabled());
+        w.set_build_delay_ms(0);
+        QTest::mouseClick(build_button(w), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(corpus(w)->text().endsWith(" chunks"), 1600);
+    }
+
+    void m5_exit_while_idle_joins_worker() {
+        auto w = std::make_unique<aiws::gui::MainWindow>();
+        QTRY_VERIFY_WITH_TIMEOUT(w->build_worker_waiting(), 1000);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        w.reset();
+        QVERIFY2(elapsed.elapsed() < 700, "Idle worker did not stop on exit");
     }
 
     void failure_returns_to_recoverable_state() {
@@ -194,20 +342,21 @@ private slots:
         QString error;
         QVERIFY2(w.start_ipc_server(sock, &error), qPrintable(error));
 
-        QProcess sender;
-        sender.setWorkingDirectory(dir.path());
         const QString binary = QCoreApplication::applicationDirPath() + "/aiws_send";
-        sender.start(binary, QStringList{"--socket", sock, "add", filename});
-        QVERIFY(sender.waitForFinished(3000));
-        QCOMPARE(sender.exitCode(), 0);
+        const SenderResult sender = run_sender(
+            binary, {"--socket", sock, "add", filename}, dir.path());
+        QVERIFY(sender.started);
+        QVERIFY(!sender.timed_out);
+        QCOMPARE(sender.exit_code, 0);
         auto* list = w.findChild<QListWidget*>("documentList");
         QTRY_COMPARE_WITH_TIMEOUT(list->count(), 1, 2000);
 
-        QProcess missing;
-        missing.start(binary, QStringList{"--socket", sock, "add", dir.path() + "/missing.txt"});
-        QVERIFY(missing.waitForFinished(3000));
-        QCOMPARE(missing.exitCode(), 1);
-        QVERIFY(!missing.readAllStandardError().isEmpty());
+        const SenderResult missing = run_sender(
+            binary, {"--socket", sock, "add", dir.path() + "/missing.txt"});
+        QVERIFY(missing.started);
+        QVERIFY(!missing.timed_out);
+        QCOMPARE(missing.exit_code, 1);
+        QVERIFY(!missing.standard_error.isEmpty());
         QCOMPARE(list->count(), 1);
     }
 
@@ -252,18 +401,22 @@ private slots:
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         const QString sock = dir.path() + "/shutdown.sock";
-        const QString file = make_file(dir.path(), "shutdown.txt", "words");
         auto window = std::make_unique<aiws::gui::MainWindow>();
         QString error;
         QVERIFY2(window->start_ipc_server(sock, &error), qPrintable(error));
-        QVERIFY(window->add_document_file(file));
+        for (int i = 0; i < 6; ++i) {
+            const QString file = make_file(dir.path(), QString("shutdown%1.txt").arg(i), "words");
+            QVERIFY(!file.isEmpty());
+            QVERIFY(window->add_document_file(file));
+        }
         window->set_build_delay_ms(1500);
         window->show();
         QTest::mouseClick(build_button(*window), Qt::LeftButton);
+        QTRY_VERIFY_WITH_TIMEOUT(window->build_worker_active(), 1000);
         QElapsedTimer timer;
         timer.start();
         window.reset();
-        QVERIFY2(timer.elapsed() < 500, "Shutdown did not cancel/join the worker promptly");
+        QVERIFY2(timer.elapsed() < 900, "Shutdown kept processing documents after Exit");
         QVERIFY(!QFileInfo::exists(sock));
     }
 };

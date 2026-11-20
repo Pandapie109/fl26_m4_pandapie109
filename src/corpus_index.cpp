@@ -11,10 +11,16 @@ CorpusIndex::CorpusIndex(const std::vector<Chunk>& chunks) { build(chunks);
 }
 
 void CorpusIndex::build(const std::vector<Chunk>& chunks) {
+    build_cancelable(chunks, [] { return false; });
+}
+
+bool CorpusIndex::build_cancelable(const std::vector<Chunk>& chunks,
+                                   const std::function<bool()>& cancelled) {
     std::unordered_map<std::string, std::vector<Posting>> next_postings;
     std::unordered_map<std::string, std::size_t> next_lookup;
 
     for (std::size_t i = 0; i < chunks.size(); ++i) {
+        if (cancelled()) return false;
         if (!next_lookup.emplace(chunks[i].id, i).second) {
             throw std::invalid_argument("duplicate chunk id: " + chunks[i].id);
         }
@@ -26,8 +32,10 @@ void CorpusIndex::build(const std::vector<Chunk>& chunks) {
         }
     }
 
+    if (cancelled()) return false;
     postings_ = std::move(next_postings);
     chunk_by_id_ = std::move(next_lookup);
+    return true;
 }
 
 std::size_t CorpusIndex::document_frequency(const std::string& normalized_term) const noexcept {

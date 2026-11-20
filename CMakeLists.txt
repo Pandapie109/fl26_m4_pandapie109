@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ai_workspace_m4 LANGUAGES CXX)
+project(ai_workspace_m5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,6 +28,8 @@ target_link_libraries(aiws_ipc PUBLIC Threads::Threads)
 add_library(aiws_gui STATIC
     src/main_window.cpp
     src/async_corpus_build.cpp
+    src/corpus_state.cpp
+    include/aiws/gui/corpus_state.hpp
     src/workspace_widget.cpp
     src/search_widget.cpp
     src/context_widget.cpp
@@ -45,8 +47,8 @@ set_target_properties(aiws_gui PROPERTIES AUTOMOC ON)
 target_include_directories(aiws_gui PUBLIC include)
 target_link_libraries(aiws_gui PUBLIC aiws_m2 aiws_ipc Qt6::Widgets Threads::Threads)
 
-add_executable(ai_workspace_m4 src/main.cpp)
-target_link_libraries(ai_workspace_m4 PRIVATE aiws_gui)
+add_executable(ai_workspace_m5 src/main.cpp)
+target_link_libraries(ai_workspace_m5 PRIVATE aiws_gui)
 
 add_executable(aiws_send tools/aiws_send.cpp)
 target_link_libraries(aiws_send PRIVATE aiws_ipc)
@@ -65,14 +67,15 @@ if(BUILD_TESTING)
     set_tests_properties(student_tests PROPERTIES
         ENVIRONMENT "QT_QPA_PLATFORM=offscreen"
         TIMEOUT 55)
+    set_tests_properties(backend_ipc_tests PROPERTIES TIMEOUT 55)
 endif()
 
 if(MSVC)
-    foreach(t aiws_m2 aiws_ipc aiws_gui ai_workspace_m4 aiws_send)
+    foreach(t aiws_m2 aiws_ipc aiws_gui ai_workspace_m5 aiws_send)
         target_compile_options(${t} PRIVATE /W4)
     endforeach()
 else()
-    foreach(t aiws_m2 aiws_ipc aiws_gui ai_workspace_m4 aiws_send)
+    foreach(t aiws_m2 aiws_ipc aiws_gui ai_workspace_m5 aiws_send)
         target_compile_options(${t} PRIVATE -Wall -Wextra -Wpedantic)
     endforeach()
 endif()

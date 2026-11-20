@@ -7,6 +7,9 @@
 #include "aiws/text_processor.hpp"
 
 #include <stdexcept>
+#include <chrono>
+#include <thread>
+#include <algorithm>
 #include <unordered_set>
 #include <utility>
 
@@ -56,12 +59,19 @@ std::string ProcessingCore::normalize(const std::string& text) {
 }
 
 void ProcessingCore::rebuild(const Workspace& workspace) {
+    rebuild_cancelable(workspace, [] { return false; }, 0);
+}
+
+bool ProcessingCore::rebuild_cancelable(const Workspace& workspace,
+                                        const std::function<bool()>& cancelled,
+                                        int delay_ms_per_document,
+                                        const std::function<void(int)>& wait_for_delay) {
     std::unordered_set<std::string> document_ids;
     std::vector<Chunk> next_chunks;
 
     for (std::size_t order = 0; order < workspace.documents().size(); ++order) {
+        if (cancelled()) return false;
         const auto& doc = workspace.documents()[order];
-
         if (!document_ids.insert(doc.id()).second) {
             throw std::invalid_argument("duplicate document id: " + doc.id());
         }
@@ -70,12 +80,25 @@ void ProcessingCore::rebuild(const Workspace& workspace) {
         next_chunks.insert(next_chunks.end(),
                            std::make_move_iterator(produced.begin()),
                            std::make_move_iterator(produced.end()));
+
+        // The worker can interrupt its build delay when the workspace changes.
+        // Other callers can still use the normal delay without a worker.
+        if (delay_ms_per_document > 0) {
+            if (wait_for_delay) {
+                wait_for_delay(delay_ms_per_document);
+            } else {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(delay_ms_per_document));
+            }
+        }
+        if (cancelled()) return false;
     }
 
-    CorpusIndex next_index(next_chunks);
-
+    CorpusIndex next_index;
+    if (!next_index.build_cancelable(next_chunks, cancelled)) return false;
     impl_->chunks = std::move(next_chunks);
     impl_->index = std::move(next_index);
+    return true;
 }
 
 const std::vector<Chunk>& ProcessingCore::chunks() const noexcept {
