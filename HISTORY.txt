@@ -1,70 +1,101 @@
-commit dbf47b4ec4527c0e8940dde7754673e8a7df7929
-Author: M4 integration (reconstructed history) <m4-integration@local.invalid>
-Date:   2026-11-09 00:30:26 +0000
+commit 59ad33361a2a13667e0ef3047598193549399a99
+Author: Daniel <125432593+Pandapie109@users.noreply.github.com>
+Date:   2026-11-20 23:18:08 -0500
 
-    Implement M4 asynchronous builds, CR-1 IPC sender, and tests
+    Added Video
 
- CMakeLists.txt                      |  61 +++++---
- DESIGN.md                           |  17 +++
- DESIGN_NOTE.md                      |  29 ++++
- README.md                           |  50 +++++--
- include/aiws/async_corpus_build.hpp |  61 ++++++++
- include/aiws/gui/main_window.hpp    |  23 +++
- include/aiws/ipc.hpp                |  45 ++++++
- src/async_corpus_build.cpp          | 124 ++++++++++++++++
- src/ipc.cpp                         | 278 ++++++++++++++++++++++++++++++++++++
- src/main.cpp                        |  38 +++++
- src/main_window.cpp                 | 151 +++++++++++++++-----
- src/workspace_widget.cpp            |   3 +
- tests/backend_ipc_tests.cpp         | 108 ++++++++++++++
- tests/student_tests.cpp             | 220 ++++++++++++++++++++++++++++
- tools/aiws_send.cpp                 |  32 +++++
- 15 files changed, 1175 insertions(+), 65 deletions(-)
+ VIDEO.md | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
 
-commit 58fccdec98cea9543ce67b6dbbaf00272317d8a3
-Author: M4 integration (reconstructed history) <m4-integration@local.invalid>
-Date:   2026-11-09 00:30:26 +0000
+commit f9e65a4c8178f8782bc8b4127e077263dc06060a
+Author: Daniel <125432593+Pandapie109@users.noreply.github.com>
+Date:   2026-11-20 06:50:19 -0500
 
-    Import supplied M3 source archive as M4 baseline
+    M5 update
 
- CMakeLists.txt                             |  51 ++++++
- README.md                                  |  25 +++
+ CMakeLists.txt                      |  13 +-
+ DESIGN.md                           |  90 ++++---------
+ include/aiws/async_corpus_build.hpp |  69 ++++++----
+ include/aiws/corpus_index.hpp       |   3 +
+ include/aiws/gui/corpus_state.hpp   |  31 +++++
+ include/aiws/gui/main_window.hpp    | 119 ++++--------------
+ include/aiws/processing_core.hpp    |   6 +
+ src/async_corpus_build.cpp          | 245 +++++++++++++++++++++++-------------
+ src/corpus_index.cpp                |   8 ++
+ src/corpus_state.cpp                | 115 +++++++++++++++++
+ src/main.cpp                        |   2 +-
+ src/main_window.cpp                 | 165 +++++++++++++-----------
+ src/processing_core.cpp             |  29 ++++-
+ tests/backend_ipc_tests.cpp         |  69 +++++++---
+ tests/student_tests.cpp             | 197 +++++++++++++++++++++++++----
+ 15 files changed, 770 insertions(+), 391 deletions(-)
+
+commit 14ebe3a9041542dd0795a0a2ce4acf83605403d8
+Author: Daniel <125432593+Pandapie109@users.noreply.github.com>
+Date:   2026-11-08 21:20:07 -0500
+
+    Fixed Grade errors
+
+ src/main_window.cpp     |  9 +++++++--
+ tests/student_tests.cpp | 52 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 59 insertions(+), 2 deletions(-)
+
+commit 071236bf25e233fb57155223d33bbf6edb751657
+Author: Daniel <125432593+Pandapie109@users.noreply.github.com>
+Date:   2026-11-08 20:40:12 -0500
+
+    Final Submission for Project4
+    
+    I did not upload to git when I finished stuff so I have only one day on my history.txt
+
+ CMakeLists.txt                             |  78 +++++++
+ DESIGN.md                                  |  73 ++++++
+ DESIGN_NOTE.md                             |  29 +++
+ HISTORY.txt                                |  70 ++++++
+ README.md                                  |  44 ++++
  data/public/doc_ai.txt                     |   3 +
  data/public/doc_retrieval.txt              |   3 +
  data/public/doc_systems.txt                |   3 +
  data/public/queries.txt                    |   4 +
- include/aiws/chunker.hpp                   |  25 +++
+ include/aiws/async_corpus_build.hpp        |  61 +++++
+ include/aiws/chunker.hpp                   |  25 ++
  include/aiws/chunking_strategy.hpp         |  18 ++
  include/aiws/context_builder.hpp           |  13 ++
  include/aiws/context_strategy.hpp          |  17 ++
- include/aiws/corpus_index.hpp              |  36 ++++
- include/aiws/document.hpp                  |  22 +++
- include/aiws/gui/context_widget.hpp        |  75 ++++++++
- include/aiws/gui/main_window.hpp           | 142 +++++++++++++++
- include/aiws/gui/resettable.hpp            |  22 +++
- include/aiws/gui/search_result_model.hpp   |  84 +++++++++
- include/aiws/gui/search_widget.hpp         | 105 +++++++++++
- include/aiws/gui/term_inspector_widget.hpp |  81 +++++++++
- include/aiws/gui/workspace_widget.hpp      | 101 +++++++++++
- include/aiws/processing_core.hpp           |  53 ++++++
- include/aiws/processing_types.hpp          |  38 ++++
+ include/aiws/corpus_index.hpp              |  36 +++
+ include/aiws/document.hpp                  |  22 ++
+ include/aiws/gui/context_widget.hpp        |  75 ++++++
+ include/aiws/gui/main_window.hpp           | 165 +++++++++++++
+ include/aiws/gui/resettable.hpp            |  22 ++
+ include/aiws/gui/search_result_model.hpp   |  84 +++++++
+ include/aiws/gui/search_widget.hpp         | 105 +++++++++
+ include/aiws/gui/term_inspector_widget.hpp |  81 +++++++
+ include/aiws/gui/workspace_widget.hpp      | 101 ++++++++
+ include/aiws/ipc.hpp                       |  45 ++++
+ include/aiws/processing_core.hpp           |  53 +++++
+ include/aiws/processing_types.hpp          |  38 +++
  include/aiws/retrieval_engine.hpp          |  18 ++
- include/aiws/retrieval_strategy.hpp        |  20 +++
+ include/aiws/retrieval_strategy.hpp        |  20 ++
  include/aiws/text_processor.hpp            |  29 +++
  include/aiws/workspace.hpp                 |  19 ++
- src/chunker.cpp                            |  59 ++++++
+ src/async_corpus_build.cpp                 | 124 ++++++++++
+ src/chunker.cpp                            |  59 +++++
  src/context_builder.cpp                    |  29 +++
- src/context_widget.cpp                     |  91 ++++++++++
- src/corpus_index.cpp                       |  72 ++++++++
+ src/context_widget.cpp                     |  91 ++++++++
+ src/corpus_index.cpp                       |  72 ++++++
  src/document.cpp                           |  14 ++
- src/main.cpp                               |  19 ++
- src/main_window.cpp                        | 276 +++++++++++++++++++++++++++++
- src/processing_core.cpp                    | 124 +++++++++++++
- src/retrieval_engine.cpp                   |  86 +++++++++
- src/search_result_model.cpp                |  72 ++++++++
- src/search_widget.cpp                      | 152 ++++++++++++++++
- src/term_inspector_widget.cpp              |  70 ++++++++
- src/text_processor.cpp                     | 116 ++++++++++++
+ src/ipc.cpp                                | 278 ++++++++++++++++++++++
+ src/main.cpp                               |  57 +++++
+ src/main_window.cpp                        | 361 +++++++++++++++++++++++++++++
+ src/processing_core.cpp                    | 124 ++++++++++
+ src/retrieval_engine.cpp                   |  86 +++++++
+ src/search_result_model.cpp                |  72 ++++++
+ src/search_widget.cpp                      | 152 ++++++++++++
+ src/term_inspector_widget.cpp              |  70 ++++++
+ src/text_processor.cpp                     | 116 +++++++++
  src/workspace.cpp                          |  17 ++
- src/workspace_widget.cpp                   |  96 ++++++++++
- 40 files changed, 2300 insertions(+)
+ src/workspace_widget.cpp                   |  99 ++++++++
+ tests/backend_ipc_tests.cpp                | 108 +++++++++
+ tests/student_tests.cpp                    | 220 ++++++++++++++++++
+ tools/aiws_send.cpp                        |  32 +++
+ 50 files changed, 3535 insertions(+)
